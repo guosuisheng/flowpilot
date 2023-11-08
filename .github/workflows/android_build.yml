@@ -20,12 +20,20 @@ jobs:
         java-version: '11'
         distribution: 'temurin'
         cache: gradle
+        
+    - name: Set up Android SDK
+      run: |
+        wget -q https://dl.google.com/android/repository/commandlinetools-linux-6858069_latest.zip -O android-sdk-tools.zip
+        unzip -q android-sdk-tools.zip -d $HOME/android-sdk
+        export ANDROID_HOME=$HOME/android-sdk
+        export PATH=$ANDROID_HOME/cmdline-tools/bin:$PATH
+        sdkmanager "build-tools;30.0.3" "platforms;android-30" "platform-tools"
+        yes | sdkmanager --licenses
 
-    - uses: nttld/setup-ndk@v1
-      id: setup-ndk
+    - name: Set up Gradle
+      uses: gradle/wrapper-action@v4
       with:
-        ndk-version: r25c
-        link-to-sdk: true
+        gradle-version: 7.2 # You can adjust the Gradle version
 
     - name: Build and package APK
       run: |
