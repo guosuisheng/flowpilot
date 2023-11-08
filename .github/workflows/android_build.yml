@@ -22,6 +22,8 @@ jobs:
         cache: gradle
         
     - name: Setup Android SDK
+      uses: android-actions/setup-android@v2
+    - name: Set Version of SDK
       run: sdkmanager "ndk;21.1.6352462" "cmake;3.18.1"
 
 
