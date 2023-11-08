@@ -22,7 +22,10 @@ jobs:
 
     - name: Build and package APK
       run: |
-        ./gradlew assembleRelease
+        cd android
+        if [ ! -f "gradlew" ]; then gradle wrapper; fi
+        chmod +x gradlew
+        ./gradlew assembleDebug --stacktrace  
       env:
         JAVA_HOME: ${{ env.JAVA_HOME }}
 
