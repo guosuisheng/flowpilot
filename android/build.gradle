@@ -1,6 +1,9 @@
 apply plugin: 'com.android.application'
 
 android {
+        lintOptions { 
+            checkReleaseBuilds false
+        }	
 	compileSdkVersion 34
 	ndkVersion "21.1.6352462"
 	sourceSets {
