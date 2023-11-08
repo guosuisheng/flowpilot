@@ -29,7 +29,6 @@ jobs:
 
     - name: Build and package APK
       run: |
-        cd android
         if [ ! -f "gradlew" ]; then gradle wrapper; fi
         chmod +x gradlew
         ./gradlew assembleDebug --stacktrace  --info 
