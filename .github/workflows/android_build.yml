@@ -23,6 +23,8 @@ jobs:
         
     - name: Setup Android SDK
       uses: android-actions/setup-android@v3
+      run: sdkmanager "ndk;21.1.6352462" "cmake;3.18.1"
+
 
     - name: Build and package APK
       run: |
