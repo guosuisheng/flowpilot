@@ -13,7 +13,9 @@ TRAJECTORY_SIZE = 33
 CAMERA_OFFSET = 0.08
 MIN_LANE_DISTANCE = 2.6
 MAX_LANE_DISTANCE = 3.7
-KEEP_MIN_DISTANCE_FROM_LANE = 1.35
+TYPICAL_MIN_LANE_DISTANCE = 2.7
+TYPICAL_MAX_LANE_DISTANCE = 3.4
+CENTER_FORCE_GENERAL_SCALE = 0.4
 
 def clamp(num, min_value, max_value):
   # weird broken case, do something reasonable
@@ -53,7 +55,6 @@ class LanePlanner:
     self.UseModelPath = self.Options.get_bool("UseModelPath")
     self.BigModel = self.Options.get_bool("F3")
     self.updateOptions = 100
-    self.tire_stiffness_multiplier = 1.0
 
     self.lll_prob = 0.
     self.rll_prob = 0.
@@ -156,56 +157,58 @@ class LanePlanner:
 
   def get_nlp_path(self, CS, v_ego, path_t, path_xyz, vcurv):
     # how visible is each lane?
-    l_vis = (self.lll_prob * 0.6667 + 0.3333) * interp(self.lll_std, [0, 0.3, 0.9], [1.0, 0.4, 0.0])
-    r_vis = (self.rll_prob * 0.6667 + 0.3333) * interp(self.rll_std, [0, 0.3, 0.9], [1.0, 0.4, 0.0])
-    lane_trust = clamp(1.1 * max(l_vis, r_vis) ** 0.5, 0.0, 1.0)
+    l_vis = (self.lll_prob * 0.9 + 0.1) * interp(self.lll_std, [0, 0.3, 0.9], [1.0, 0.4, 0.0])
+    r_vis = (self.rll_prob * 0.9 + 0.1) * interp(self.rll_std, [0, 0.3, 0.9], [1.0, 0.4, 0.0])
+    lane_trust = clamp(1.2 * max(l_vis, r_vis) ** 0.5, 0.0, 1.0)
     # make sure we have something with lanelines to work with
     # otherwise, we will default to laneless
     if lane_trust > 0.025 and len(vcurv) == len(self.lll_y):
-      # give a boost to closer lanes
-      distance = self.rll_y[0] - self.lll_y[0]
-      left_ratio = 0.25 + (self.rll_y[0] / distance) * 0.5 # if rll_y is big, we are more left
-      l_vis *= left_ratio
-      r_vis *= (1.0 - left_ratio)
       # normalize to 1
       total_prob = l_vis + r_vis
       l_prob = l_vis / total_prob
       r_prob = r_vis / total_prob
 
       # Find current lanewidth
+      width_trust = min(l_vis, r_vis)
       raw_current_width = abs(min(self.rll_y[0], self.re_y[0]) - max(self.lll_y[0], self.le_y[0]))
       current_lane_width = clamp(raw_current_width, MIN_LANE_DISTANCE, MAX_LANE_DISTANCE)
       self.lane_width_estimate.update(current_lane_width)
-      self.lane_width = self.lane_width_estimate.x
-
-      # should we tighten up steering if the lane is really tight?
-      lane_tightness = min(raw_current_width, self.lane_width)
-      self.tire_stiffness_multiplier = interp(lane_tightness, [2.6, 2.8], [0.7143, 1.0])
+      speed_lane_width = interp(v_ego, [0., 31.], [TYPICAL_MIN_LANE_DISTANCE, TYPICAL_MAX_LANE_DISTANCE])
+      self.lane_width = lerp(speed_lane_width, self.lane_width_estimate.x, width_trust)
+      lane_tightness = min(raw_current_width, self.lane_width_estimate.x)
 
       # track how wide the lanes are getting up ahead
       max_lane_width_seen = current_lane_width
       half_len = len(self.lll_y) // 2
 
       # additional centering force, if needed
-      wiggle_room = (lane_tightness * 0.5) - KEEP_MIN_DISTANCE_FROM_LANE
-      if wiggle_room > 0:
-        target_centering = clamp((self.rll_y[0] + self.lll_y[0]) * 0.5, -wiggle_room, wiggle_room)
-        if self.lll_y[0] > -KEEP_MIN_DISTANCE_FROM_LANE:
-          # too close to a left lane, apply full right centering force
-          self.center_force = max(target_centering, min(0.5, KEEP_MIN_DISTANCE_FROM_LANE + self.lll_y[0]))
-        elif self.rll_y[0] < KEEP_MIN_DISTANCE_FROM_LANE:
-          # too close to a right lane, apply full left centering force
-          self.center_force = min(target_centering, max(-0.5, self.rll_y[0] - KEEP_MIN_DISTANCE_FROM_LANE))
-        elif target_centering > 0.0:
-          # want to center more right
-          self.center_force = clamp(self.center_force + target_centering * 0.01, 0.0, target_centering)
-        else:
-          # want to center more left
-          self.center_force = clamp(self.center_force - target_centering * 0.01, target_centering, 0.0)
-        # if we are lane changing, cut center force
-        self.center_force *= self.lane_change_multiplier
-      else:
-        self.center_force = 0.0
+      rightBorder = min(self.re_y[0], self.rll_y[1])
+      leftBorder = max(self.le_y[0], self.lll_y[1])
+      nearRightEdge = abs(self.rll_y[0] - rightBorder) < MIN_LANE_DISTANCE * 0.8
+      nearLeftEdge = abs(self.lll_y[0] - leftBorder) < MIN_LANE_DISTANCE * 0.8
+      # ok, how far off of center are we, considering we want to be closer to edges of the road?
+      target_centering = self.rll_y[0] + self.lll_y[0]
+      # if we are not near an edge, center harder away from it (since it is probably another lane)
+      if target_centering > 0:
+        # we want to push right, near a left edge?
+        target_centering *= 0.9 if nearLeftEdge else 1.5
+      elif target_centering < 0:
+        # we want to push left, not near a right edge?
+        target_centering *= 0.9 if nearRightEdge else 1.5
+      # fancy smooth increasing centering force based on lane width
+      self.center_force = CENTER_FORCE_GENERAL_SCALE * (TYPICAL_MAX_LANE_DISTANCE / self.lane_width) * target_centering
+      # if we are lane changing, cut center force
+      self.center_force *= self.lane_change_multiplier
+      # if we are in a small lane, reduce centering force to prevent pingponging
+      self.center_force *= interp((lane_tightness + self.lane_width) * 0.5, [2.6, 2.8], [0.0, 1.0])
+      # likewise if the lane is really big, reduce centering force to not throw us around in it
+      self.center_force *= interp((lane_tightness + self.lane_width) * 0.5, [4.0, 6.0], [1.0, 0.0])
+      # apply a cap centering force
+      self.center_force = clamp(self.center_force, -0.8, 0.8)
+      # apply less lane centering for a direction we are already turning
+      # this helps avoid overturning in an existing turn
+      if math.copysign(1, self.center_force) == math.copysign(1, vcurv[0]):
+        self.center_force *= 0.7
 
       # go through all points in our lanes...
       for index in range(len(self.lll_y) - 1, -1, -1):
@@ -219,26 +222,20 @@ class LanePlanner:
         if lane_width > max_lane_width_seen and index <= half_len:
           max_lane_width_seen = lane_width
         # how much do we trust this? we want to be seeing both pretty well
-        width_trust = min(l_vis, r_vis)
-        final_lane_width = min(lane_width, lerp(self.lane_width, lane_width, width_trust))
-        use_min_lane_distance = min(final_lane_width * 0.5, KEEP_MIN_DISTANCE_FROM_LANE)
+        final_lane_width = clamp(min(lane_width, self.lane_width), MIN_LANE_DISTANCE, MAX_LANE_DISTANCE)
         # ok, get ideal point from each lane
         ideal_left = left_anchor + final_lane_width * 0.5
         ideal_right = right_anchor - final_lane_width * 0.5
         # merge them to get an ideal center point, based on which value we want to prefer
         ideal_point = lerp(ideal_left, ideal_right, r_prob)
-        # clamp the path to the lane this spot is closest to
-        if abs(self.rll_y[0]) > abs(self.lll_y[0]):
-          # closer to the left lane
-          ideal_point = clamp(ideal_point, left_anchor + use_min_lane_distance, right_anchor)
-        else:
-          # closer to right lane
-          ideal_point = clamp(ideal_point, left_anchor, right_anchor - use_min_lane_distance)
-        # add it to our ultimate path with centering force
+        # add it to our ultimate path
         self.ultimate_path[index] = ideal_point
 
       # do we want to mix in the model path a little bit if lanelines are going south?
-      final_ultimate_path_mix = self.lane_change_multiplier * lane_trust * interp(max_lane_width_seen, [4.0, 6.0], [1.0, 0.0]) if not self.UseModelPath else 0.0
+      ultimate_path_mix = 0.0
+      if not self.UseModelPath:
+        ultimate_path_mix = lane_trust * interp(max_lane_width_seen, [4.0, 6.0], [1.0, 0.0])
+      final_ultimate_path_mix = clamp(self.lane_change_multiplier * ultimate_path_mix, 0.0, 0.8) # always have at least 20% model path in there
 
       # debug
       sLogger.Send("Cf" + "{:.2f}".format(self.center_force) + " Mx" + "{:.2f}".format(final_ultimate_path_mix) + " vC" + "{:.2f}".format(vcurv[0]) + " LX" + "{:.1f}".format(self.lll_y[0]) + " RX" + "{:.1f}".format(self.rll_y[0]) + " LW" + "{:.1f}".format(self.lane_width) + " LP" + "{:.1f}".format(l_prob) + " RP" + "{:.1f}".format(r_prob) + " RS" + "{:.1f}".format(self.rll_std) + " LS" + "{:.1f}".format(self.lll_std))
@@ -248,7 +245,6 @@ class LanePlanner:
         path_xyz[:,1] = final_ultimate_path_mix * np.interp(path_t, self.ll_t[safe_idxs], self.ultimate_path[safe_idxs]) + (1 - final_ultimate_path_mix) * path_xyz[:,1]
     else:
       self.center_force = 0.0
-      self.tire_stiffness_multiplier = 1.0
       sLogger.Send("Lanes lost completely! Using model path entirely...")
 
     # apply camera offset and centering force after everything

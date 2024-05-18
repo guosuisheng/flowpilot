@@ -58,7 +58,7 @@ class CarInterface(CarInterfaceBase):
       if 0x38d in fingerprint[0] or 0x38d in fingerprint[2]:
         ret.flags |= HyundaiFlags.USE_FCA.value
 
-    ret.steerActuatorDelay = 0.33  # kona ev delay
+    ret.steerActuatorDelay = 0.3  # kona ev delay
     ret.steerLimitTimer = 0.4
     tire_stiffness_factor = 1.
     CarInterfaceBase.configure_torque_tune(candidate, ret.lateralTuning)
@@ -107,9 +107,9 @@ class CarInterface(CarInterfaceBase):
     elif candidate in (CAR.KONA, CAR.KONA_EV, CAR.KONA_HEV, CAR.KONA_EV_2022):
       ret.mass = {CAR.KONA_EV: 1685., CAR.KONA_HEV: 1425., CAR.KONA_EV_2022: 1743.}.get(candidate, 1275.) + STD_CARGO_KG
       ret.wheelbase = 2.6
-      ret.steerRatio = 13.42
-      tire_stiffness_factor = 0.7
-      ret.lateralTuning.torque.kf = 0.9 # overall turn multiplier
+      ret.steerRatio = 10.75
+      tire_stiffness_factor = 0.385
+      ret.lateralTuning.torque.kf = 1.0 # overall turn multiplier
       ret.lateralTuning.torque.kp = 1.0 # overall error multiplier
     elif candidate in (CAR.IONIQ, CAR.IONIQ_EV_LTD, CAR.IONIQ_PHEV_2019, CAR.IONIQ_HEV_2022, CAR.IONIQ_EV_2020, CAR.IONIQ_PHEV):
       ret.mass = 1490. + STD_CARGO_KG  # weight per hyundai site https://www.hyundaiusa.com/ioniq-electric/specifications.aspx

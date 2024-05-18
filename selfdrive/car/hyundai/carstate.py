@@ -91,8 +91,9 @@ class CarState(CarStateBase):
         self.cluster_speed = math.floor(self.cluster_speed * CV.KPH_TO_MPH + CV.KPH_TO_MPH)
 
     ret.vEgoCluster = self.cluster_speed * speed_conv
+    ret.engineRpm = cp.vl["ELECT_GEAR"]["Elect_Gear_Step"]
 
-    ret.steeringAngleDeg = cp.vl["SAS11"]["SAS_Angle"] + 1.9 # my kona ev has a degree offset compensated here
+    ret.steeringAngleDeg = cp.vl["SAS11"]["SAS_Angle"] + 2.0 # kona ev steering offset
     ret.steeringRateDeg = cp.vl["SAS11"]["SAS_Speed"]
     ret.yawRate = cp.vl["ESP12"]["YAW_RATE"]
     ret.leftBlinker, ret.rightBlinker = self.update_blinker_from_lamp(
@@ -111,8 +112,7 @@ class CarState(CarStateBase):
     ret.cruiseState.available = ret.cruiseState.enabled = self.openPilotEnabled
     #ret.cruiseState.standstill = False
 
-    # TODO: Find brake pressure
-    ret.brake = 0
+    ret.brake = 0 #cp.vl["IEB_2A2"]["Regen_Maybe"]
     ret.brakePressed = cp.vl["TCS13"]["DriverBraking"] != 0
     ret.brakeHoldActive = cp.vl["TCS15"]["AVH_LAMP"] == 2  # 0 OFF, 1 ERROR, 2 ACTIVE, 3 READY
     ret.parkingBrake = cp.vl["TCS13"]["PBRAKE_ACT"] == 1
@@ -160,6 +160,8 @@ class CarState(CarStateBase):
     self.lkas11 = copy.copy(cp_cam.vl["LKAS11"])
     self.clu11 = copy.copy(cp.vl["CLU11"])
     self.mdps12 = copy.copy(cp.vl["MDPS12"])
+    self.elect = copy.copy(cp.vl["ELECT_GEAR"])
+    #self.vcu = copy.copy(cp.vl["VCU_202"])
     self.steer_state = cp.vl["MDPS12"]["CF_Mdps_ToiActive"]  # 0 NOT ACTIVE, 1 ACTIVE
     self.prev_cruise_buttons = self.cruise_buttons
     self.cruise_buttons = cruiseUpDownNow
@@ -293,6 +295,10 @@ class CarState(CarStateBase):
 
       ("ESC_Off_Step", "TCS15"),
       ("AVH_LAMP", "TCS15"),
+
+      ("Elect_Gear_Step", "ELECT_GEAR"),
+      #("Regen_Maybe", "IEB_2A2"),
+      #("REGEN_LEVEL" ,"VCU_202"),
 
       ("Cruise_Limit_Target", "E_EMS11"),
 

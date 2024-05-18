@@ -69,7 +69,7 @@ import static ai.flow.sensor.messages.MsgFrameBuffer.updateImageBuffer;
 
 public class OnRoadScreen extends ScreenAdapter {
     // avoid GC triggers.
-    static final String VERSION = "62";
+    static final String VERSION = "73";
     final WorkspaceConfiguration wsConfig = WorkspaceConfiguration.builder()
             .policyAllocation(AllocationPolicy.STRICT)
             .policyLearning(LearningPolicy.FIRST_LOOP)
@@ -473,20 +473,7 @@ public class OnRoadScreen extends ScreenAdapter {
             public void clicked(InputEvent event, float x, float y) {
                 if (!appContext.isOnRoad)
                     return;
-                infoTable.setVisible(!infoTable.isVisible());
-                if (infoTable.isVisible()) {
-                    cameraAlertBox.translate(-settingsBarWidth, 0, 0);
-                    velocityTable.moveBy(settingsBarWidth/2f, 0);
-                    alertTable.moveBy(settingsBarWidth/2f, 0);
-                    maxCruiseTable.moveBy(settingsBarWidth, 0);
-                }
-                else {
-                    cameraAlertBox.translate(settingsBarWidth, 0, 0);
-                    velocityTable.moveBy(-settingsBarWidth/2f, 0);
-                    alertTable.moveBy(-settingsBarWidth/2f, 0);
-                    maxCruiseTable.moveBy(-settingsBarWidth, 0);
-                }
-                cameraAlertBox.update();
+                setInfoTable(!infoTable.isVisible());
             }
         });
 
@@ -496,6 +483,25 @@ public class OnRoadScreen extends ScreenAdapter {
 
         sh = new ZMQSubHandler(true);
         sh.createSubscribers(Arrays.asList("lateralPlan", cameraTopic, cameraBufferTopic, deviceStateTopic, calibrationTopic, carStateTopic, controlsStateTopic, modelTopic, "roadCameraBuffer", "roadCameraState"));
+    }
+
+    public static boolean HideInfoTable;
+
+    public void setInfoTable(boolean visible) {
+        infoTable.setVisible(visible);
+        if (infoTable.isVisible()) {
+            cameraAlertBox.translate(-settingsBarWidth, 0, 0);
+            velocityTable.moveBy(settingsBarWidth/2f, 0);
+            alertTable.moveBy(settingsBarWidth/2f, 0);
+            maxCruiseTable.moveBy(settingsBarWidth, 0);
+        }
+        else {
+            cameraAlertBox.translate(settingsBarWidth, 0, 0);
+            velocityTable.moveBy(-settingsBarWidth/2f, 0);
+            alertTable.moveBy(-settingsBarWidth/2f, 0);
+            maxCruiseTable.moveBy(-settingsBarWidth, 0);
+        }
+        cameraAlertBox.update();
     }
 
     public Animation<TextureRegion> getCurrentAnimation(){
@@ -545,10 +551,12 @@ public class OnRoadScreen extends ScreenAdapter {
         }
     }
 
+    public static float LatestvEgo;
+
     public void updateCarState() {
         Definitions.Event.Reader event = sh.recv(carStateTopic);
-        float vel = event.getCarState().getVEgo();
-        vel = isMetric ? vel * 3.6f : vel * 2.237f;
+        LatestvEgo = event.getCarState().getVEgo();
+        float vel = isMetric ? LatestvEgo * 3.6f : LatestvEgo * 2.237f;
         velocityLabel.setText(Integer.toString((int)vel));
     }
 
@@ -781,6 +789,12 @@ public class OnRoadScreen extends ScreenAdapter {
 
             if (modelAlive)
                 drawModelOutputs();
+
+            // if we just got onroad, start by hiding the info on the side
+            if (HideInfoTable) {
+                setInfoTable(false);
+                HideInfoTable = false;
+            }
 
             setUnits();
 

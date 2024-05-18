@@ -23,6 +23,13 @@ LongCtrlState = car.CarControl.Actuators.LongControlState
 MAX_ANGLE = 85
 MAX_ANGLE_FRAMES = 89
 MAX_ANGLE_CONSECUTIVE_FRAMES = 2
+TICKS_FOR_HARDSTEERING_SMOOTHING = 50
+DISTSPEED_TIMEFRAME = 1.0
+DISTSPEED_AVERAGING = 4
+SLOW_THRESHOLD = 1.4
+
+def signsquare(x):
+  return x * abs(x)
 
 def clamp(num, min_value, max_value):
   return max(min(num, max_value), min_value)
@@ -77,11 +84,13 @@ class CarController:
     self.lead_accel_accum = 0.0
     self.accel_last = 0
     self.accels = []
+    self.accels_max = []
     self.apply_steer_last = 0
     self.car_fingerprint = CP.carFingerprint
     self.last_button_frame = 0
     self.lkas11_cnt = 0
     self.mdpsBus = 0
+    self.prevent_heavy_steer_timer = 0
 
     self.speed_ratios =  [0.0, 1.0,  1.05,  1.1,  1.15,  1.2,  1.25,  1.3]
     self.target_accels = [2.0, 0.0,  -0.3, -0.7,  -1.2, -1.8,  -2.5, -3.0]
@@ -102,8 +111,16 @@ class CarController:
     apply_steer = apply_driver_steer_torque_limits(new_steer, self.apply_steer_last, CS.out.steeringTorque, self.params)
 
     # if we are disabled, or the driver is doing a sharp turn themselves, don't apply any additional steering
-    if not CC.latActive or abs(CS.out.steeringAngleDeg) > 89 and CS.out.steeringPressed:
+    if CS.out.steeringPressed:
+      self.prevent_heavy_steer_timer = TICKS_FOR_HARDSTEERING_SMOOTHING
+    elif self.prevent_heavy_steer_timer > 0:
+      self.prevent_heavy_steer_timer -= 1
+
+    if not CC.latActive:
       apply_steer = 0
+    elif abs(CS.out.steeringAngleDeg) > 89 and self.prevent_heavy_steer_timer > 0:
+      # gradually bring steering back in on sharp turns
+      apply_steer = lerp(apply_steer, 0, self.prevent_heavy_steer_timer / TICKS_FOR_HARDSTEERING_SMOOTHING)
 
     self.apply_steer_last = apply_steer
 
@@ -167,16 +184,23 @@ class CarController:
     # this looks for stop signs and red lights
     # accels is a weird type so we will iterate over it and take a lowest average
     accel_count = len(long_plan.accels)
-    avg_accel = max_speed_in_mph
+    avg_accel_min = max_speed_in_mph
+    avg_accel_max = max_speed_in_mph
     if accel_count > 4:
       accel_smallest = 9999
+      accel_biggest = 0
       for i in range(0, accel_count):
         if long_plan.accels[i] < accel_smallest:
           accel_smallest = long_plan.accels[i]
+        if long_plan.accels[i] > accel_biggest:
+          accel_biggest = long_plan.accels[i]
       self.accels.append(accel_smallest * CV.MS_TO_MPH)
+      self.accels_max.append(accel_biggest * CV.MS_TO_MPH)
       if len(self.accels) > 20:
-        avg_accel = statistics.fmean(self.accels)
+        avg_accel_min = statistics.fmean(self.accels)
+        avg_accel_max = statistics.fmean(self.accels_max)
         self.accels.pop(0)
+        self.accels_max.pop(0)
 
     # get biggest upcoming curve value, ignoring the curve we are currently on (so we plan ahead better)
     vcurv = 0
@@ -192,39 +216,62 @@ class CarController:
     radarState = sm['radarState']
     l0prob = radarState.leadOne.modelProb
     l0d = radarState.leadOne.dRel
+    l0dstd = radarState.leadOne.aLeadK
     l0v = radarState.leadOne.vRel
     l0vstd = radarState.leadOne.vLeadK
+    l0time = radarState.leadOne.aLeadTau
 
-    # adjust l0v based on l0vstd and l0v
-    l0vstd_multiplier = 1.5 / (1 + math.exp(-2*l0v)) - 0.75
-    lead_vdiff_mph = (l0v + l0vstd_multiplier * l0vstd) * 2.23694
+    # default use basic speed adjustment
+    use_basic_speedadj = True
 
-    # store distance history of lead car to merge with l0v to get a better speed relative value
-    l0v_distval_mph = 0
+    # if we are using the distspeed feature, monitor distance to better estimate speed within standard deviation
     if l0prob > 0.5 and self.usingDistSpeed:
-      # ok, start averaging this distance value
+      # ok, start collecting data on the lead car
       self.lead_distance_hist.append(l0d)
-      # if we've got enough data to calculate an average distance, do so now
-      if len(self.lead_distance_hist) > 60:
-        self.lead_distance_distavg.append(statistics.fmean(reject_outliers(self.lead_distance_hist)))
-        self.lead_distance_times.append(datetime.datetime.now())
-        self.lead_distance_hist.pop(0)
-        # do we have enough distances over time to get a distspeed estimate?
-        if len(self.lead_distance_distavg) > 30:
-          time_diff = (self.lead_distance_times[-1] - self.lead_distance_times[0]).total_seconds()
-          dist_diff = self.lead_distance_distavg[-1] - self.lead_distance_distavg[0]
-          self.lead_distance_distavg.pop(0)
-          self.lead_distance_times.pop(0)
-          l0v_distval_mph = clamp((dist_diff / time_diff) * CV.MS_TO_MPH, lead_vdiff_mph - 15, lead_vdiff_mph + 15)
-          # reduce confidence of large values different from model's values
-          difference_factor = clamp(1.0 - ((abs(l0v_distval_mph - lead_vdiff_mph) / 15.0) ** 1.5), 0.0, 1.0)
-          if difference_factor > 0:
-            lead_vdiff_mph = lerp(lead_vdiff_mph, l0v_distval_mph, difference_factor * 0.5)
+      self.lead_distance_times.append(l0time)
+      # if we've got enough data to calculate a distspeed
+      if len(self.lead_distance_hist) >= 2:
+        time_diff = self.lead_distance_times[-1] - self.lead_distance_times[0]
+        if time_diff >= DISTSPEED_TIMEFRAME:
+            dist_diff = self.lead_distance_hist[-1] - self.lead_distance_hist[0]
+            # clamp speed to model's speed uncertainty window
+            # l0vstd is usually too tight, so allow distspeed more wiggle room
+            range_allowed = l0vstd * 1.5
+            max_allowed = (l0v + range_allowed) * CV.MS_TO_MPH
+            min_allowed = (l0v - range_allowed) * CV.MS_TO_MPH
+            raw_distspeed = dist_diff / time_diff
+            distspeed = clamp((raw_distspeed + l0v) * 0.5 * CV.MS_TO_MPH, min_allowed, max_allowed)
+            # wait, if we have a bunch of distance uncertainty, use the model speed more
+            distspeed = interp(l0dstd, [3.5, 9.0], [distspeed, l0v * CV.MS_TO_MPH])
+            # add this value to be averaged later
+            self.lead_distance_distavg.append(distspeed)
+            # clean out existing entries
+            self.lead_distance_hist.pop(0)
+            self.lead_distance_times.pop(0)
+            # do we have enough distances over time to get a distspeed estimate?
+            if len(self.lead_distance_distavg) >= DISTSPEED_AVERAGING:
+              use_basic_speedadj = False
+              lead_vdiff_mph = clamp(statistics.fmean(self.lead_distance_distavg), min_allowed, max_allowed)
+              self.lead_distance_distavg.pop(0)
     else:
       # no lead, clear data
       self.lead_distance_hist.clear()
       self.lead_distance_times.clear()
       self.lead_distance_distavg.clear()
+
+    # if we didn't get an adjusted lead car speed with distspeed estimate, use a basic speed adjustment system
+    if use_basic_speedadj:
+      # adjust l0v based on l0vstd and l0v
+      l0vstd_multiplier = 1.75 / (1 + math.exp(-l0v-0.289)) - 1.0
+
+      # if we think we should have the lead car going faster, verify we are not too close to the lead car
+      # before applying this fully
+      if l0vstd_multiplier > 0:
+        cutoff_distance = clamp(CS.out.vEgo * 1.75, 35, 60)
+        l0vstd_multiplier *= interp(l0d, [10.0, cutoff_distance], [0.0, 1.0])
+
+      # ok, get a good estimate of the lead car speed
+      lead_vdiff_mph = (l0v + l0vstd_multiplier * l0vstd) * 2.23694
 
     # start with our picked max speed
     desired_speed = max_speed_in_mph
@@ -239,41 +286,31 @@ class CarController:
     if l0prob > 0.5:
       self.lead_seen_counter += 1
       if clu11_speed > 5:
-        # amplify large lead car speed differences a bit so we react faster
-        #lead_vdiff_mph *= ((abs(lead_vdiff_mph) * 0.033) ** 1.2) + 1
-        # calculate an estimate of the lead car's speed for purposes of setting our speed
+        # calculate an estimate of the lead car's speed
         lead_speed = clu11_speed + lead_vdiff_mph
         # calculate lead car time
         speed_in_ms = clu11_speed * 0.44704
         lead_time = l0d / speed_in_ms
-        # caculate a target lead car time, which is generally 3 seconds unless we are driving fast
-        # then we need to be a little closer to keep car within good visible range
-        # and prevent big gaps where cars always are cutting in
-        target_time = 3 - ((clu11_speed / 72) ** 3)
-        # do not go under a certain lead car time for safety
-        if target_time < 2.1:
-          target_time = 2.1
-        # calculate the difference of our current lead time and desired lead time
-        lead_time_ideal_offset = lead_time - target_time
+        # caculate a target lead car time, which is 3 seconds at slow speeds, but gradually max_allowed
+        # closer for faster speeds
+        target_time = interp(clu11_speed, [20.0, 70.0], [3.0, 2.1])
+        # calculate the speed difference we should be going
+        adjust_speed = (lead_vdiff_mph * 1.33) + ((5.5 * (lead_time - target_time))/target_time) ** 3
         # don't sudden slow for certain situations, as this causes significant braking
         # 1) if the lead car is far away in either time or distance
         # 2) if the lead car is moving away from us
         leadcar_going_faster = lead_vdiff_mph >= 0.6
-        dont_sudden_slow = lead_time_ideal_offset > target_time * 0.39 or l0d >= 80 or leadcar_going_faster
-        # depending on slowing down or speeding up, scale
-        if lead_time_ideal_offset < 0:
-          lead_time_ideal_offset = -(-lead_time_ideal_offset * (10.5 / target_time)) ** 1.4  # exponentially slow down if getting closer and closer
-        else:
-          lead_time_ideal_offset = (lead_time_ideal_offset * 2) ** 1.2  # exponentially not consider lead car the further away
         # calculate the final max speed we should be going based on lead car
-        max_lead_adj = lead_speed + lead_time_ideal_offset
+        max_lead_adj = clu11_speed + adjust_speed
         # if the lead car is going faster than us, but we want to slow down for some reason (to make space etc)
         # don't go much slower than the lead car, and cancel any sudden slowing that may be happening
-        fasterleadcar_imposed_speed_limit = max(clu11_speed - 2.0, lead_speed - 2.3)
+        fasterleadcar_imposed_speed_limit = max(clu11_speed - 1.5, lead_speed - 2.3)
         if leadcar_going_faster and max_lead_adj < fasterleadcar_imposed_speed_limit:
-          max_lead_adj = fasterleadcar_imposed_speed_limit # slowly make space between cars
-        elif dont_sudden_slow and max_lead_adj < clu11_speed - 2.0:
-          max_lead_adj = clu11_speed - 2.0 # slow down, but not aggresively
+          # slowly make space between cars
+          max_lead_adj = fasterleadcar_imposed_speed_limit
+        elif leadcar_going_faster and max_lead_adj < clu11_speed - 1.5:
+          # slow down, but not aggresively
+          max_lead_adj = clu11_speed - 1.5
         elif not leadcar_going_faster and self.lead_seen_counter < 150 and max_lead_adj > clu11_speed:
           max_lead_adj = clu11_speed # dont speed up if we see a new car and its not going faster than us
         # cap our desired_speed to this final max speed
@@ -291,14 +328,14 @@ class CarController:
       self.usingDistSpeed = self.Options.get_bool("UseDistSpeed")
       self.sensitiveSlow = self.Options.get_bool("SensitiveSlow")
 
-    if self.usingAccel and (avg_accel < 8.0 or stoplinesp > 0.7) and clu11_speed < 45:
+    if self.usingAccel and (avg_accel_min < 8.0 or stoplinesp > 0.7) and clu11_speed <= 40:
       # stop sign or red light, stop!
       desired_speed = 0
-      CS.time_cruise_cancelled = datetime.datetime(2000, 10, 1, 1, 1, 1,0)
+      #CS.time_cruise_cancelled = datetime.datetime(2000, 10, 1, 1, 1, 1,0)
     elif desired_speed > 0:
       # does the model think we should be really slowing down?
-      if self.usingAccel and avg_accel < clu11_speed * 0.5 and desired_speed > clu11_speed - 1:
-        desired_speed = clu11_speed - 1
+      if self.usingAccel and avg_accel_min < clu11_speed - 10 and desired_speed > clu11_speed - 1.5:
+        desired_speed = clu11_speed - 1.5
 
       # clamp for the following divisions
       desired_speed = clamp(desired_speed, 0.001, max_speed_in_mph)
@@ -309,22 +346,29 @@ class CarController:
       target_accel_curv = interp(curve_speed_ratio, self.speed_ratios, self.target_accels)
       target_accel = min(target_accel_curv, target_accel_lead)
       if target_accel >= 0 or target_accel > CS.out.aEgo:
-        # we don't need to break this hard for any case, re-enable cruise
+        # we don't need to brake this hard for any case, re-enable cruise
         allow_reenable_cruise = True
         self.lead_accel_accum = 0.0
-      elif target_accel_curv < CS.out.aEgo - 0.25 and clu11_speed - desired_speed > 1.5:
+      elif target_accel_curv < CS.out.aEgo - 0.2 and clu11_speed - desired_speed > 1.25:
         # easy check to slow down for a curve
         desired_speed = 0
       else:
         # we might want to slow for a lead car infront of us, but we don't want to make quick small brakes
         # lets see if we should be braking enough before doing so
-        lead_accel_diff = (target_accel_lead - CS.out.aEgo) + 0.3
+        lead_accel_diff = signsquare(0.75 * (0.25 + target_accel_lead - CS.out.aEgo))
+        lead_accel_adj = lead_accel_diff * (20/100) # based off of 20 fps model and this function @ 100hz
         if lead_accel_diff < 0:
-          self.lead_accel_accum += lead_accel_diff * (20/100) # based off of 20 fps model and this function @ 100hz
+          self.lead_accel_accum += lead_accel_adj
         else:
-          self.lead_accel_accum = 0.0
+          # cap slow threshold to wean off
+          if self.lead_accel_accum < -SLOW_THRESHOLD:
+            self.lead_accel_accum = -SLOW_THRESHOLD
+          self.lead_accel_accum += lead_accel_adj
+          # never go positive
+          if self.lead_accel_accum > 0:
+            self.lead_accel_accum = 0
         # if it seems like we should be slowing down enough over time, kill cruise to brake harder
-        if self.lead_accel_accum < (-1.5 if self.sensitiveSlow else -2.0):
+        if self.lead_accel_accum < (-SLOW_THRESHOLD if self.sensitiveSlow else -(SLOW_THRESHOLD + 0.15)) and clu11_speed - desired_speed >= 1.85:
           desired_speed = 0
     else:
       # we are stopping for some other reason, clear our lead accumulator
@@ -350,7 +394,7 @@ class CarController:
       self.temp_disable_spamming -= 1
 
     # print debug data
-    sLogger.Send("0Ac" + "{:.2f}".format(CS.out.aEgo) + " CC" + "{:.1f}".format(CS.out.cruiseState.speed) + " v" + "{:.1f}".format(l0v * 2.23694) + " ta" + "{:.2f}".format(target_accel) + " Pr?" + str(CS.out.cruiseState.nonAdaptive) + " DS" + "{:.1f}".format(desired_speed) + " dV" + "{:.2f}".format(l0v_distval_mph) + " vS" + "{:.2f}".format(l0vstd * 2.23694) + " lD" + "{:.1f}".format(l0d))
+    sLogger.Send("0ac" + "{:.2f}".format(CS.out.aEgo) + " c" + "{:.1f}".format(CS.out.cruiseState.speed) + " v" + "{:.2f}".format(l0v * 2.23694) + " ta" + "{:.2f}".format(target_accel) + " la" + "{:.1f}".format(self.lead_accel_accum) + " ds" + "{:.1f}".format(desired_speed) + " dv" + "{:.2f}".format(lead_vdiff_mph) + " vs" + "{:.2f}".format(l0vstd * 2.23694) + " ld" + "{:.1f}".format(l0d) + " ms" + "{:.1f}".format(avg_accel_min) + " du" + "{:.1f}".format(l0dstd))
 
     cruise_difference = abs(CS.out.cruiseState.speed - desired_speed)
     cruise_difference_max = round(cruise_difference) # how many presses to do in bulk?
